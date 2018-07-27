@@ -1,0 +1,219 @@
+Parameters:
+  SendyURL:
+    Type: String
+  DatabaseMasterUser:
+    Type: String
+    Default: mydbinstance
+  DatabasePassword:
+    Type: String
+    Default: abcdefg123
+    MinLength: 8
+    NoEcho: true
+  DatabaseName:
+    Type: String
+    Default: sendy
+  InstanceSubnets:
+    Description: "A list of subnet identifiers of Amazon Virtual Private Cloud (Amazon VPCs)"
+    Type: List<AWS::EC2::Subnet::Id>
+Mappings:
+  RegionMap:
+    us-east-1:
+      "AMALINUX" : "ami-cfe4b2b0" #Amazon Linux AMI 2018.03.0 (HVM), SSD Volume Type
+    us-west-2:
+      "AMALINUX" : "ami-0ad99772" #Amazon Linux AMI 2018.03.0 (HVM), SSD Volume Type
+    us-west-1:
+      "AMALINUX" : "ami-e4515e0e" #Amazon Linux AMI 2018.03.0 (HVM), SSD Volume Type
+Resources:
+  WebSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupName: "my-web-access-sg-2"
+      GroupDescription: "My Web Access SG"
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: '80'
+        ToPort: '80'
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: '443'
+        ToPort: '443'
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: '22'
+        ToPort: '22'
+        CidrIp: 35.227.44.44/0
+      - IpProtocol: tcp
+        FromPort: '3306'
+        ToPort: '3306'
+        CidrIp: 0.0.0.0/0
+  myDNSRecord:
+    Type: "AWS::Route53::RecordSet"
+    Properties:
+      HostedZoneId: !Ref Route53HostedZone
+      Comment: DNS name for my instance.
+      Name: !Ref SendyURL
+      Type: A
+      AliasTarget: 
+        DNSName: !GetAtt myELB.DNSName
+        HostedZoneId: !GetAtt myELB.CanonicalHostedZoneNameID
+    DependsOn: Route53HostedZone
+  myDNSRecord2:
+    Type: "AWS::Route53::RecordSet"
+    Properties:
+      HostedZoneId: !Ref Route53HostedZone
+      Comment: Website record
+      Name: !Join [ ".", [ www, !Ref SendyURL ] ]
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt mySiteELB.DNSName
+        HostedZoneId: !GetAtt mySiteELB.CanonicalHostedZoneNameID
+    DependsOn: Route53HostedZone
+  Route53HostedZone:
+    Type: "AWS::Route53::HostedZone"
+    Properties:
+      Name: !Ref SendyURL
+  DB:
+    Type: "AWS::RDS::DBInstance"
+    Properties:
+      AllocatedStorage: 20
+      StorageType: gp2
+      DBInstanceClass: db.t2.micro
+      Engine: MySQL
+      MasterUsername: !Ref DatabaseMasterUser
+      MasterUserPassword: !Ref DatabasePassword
+      DBName: !Ref DatabaseName
+      VPCSecurityGroups:
+      - !GetAtt WebSecurityGroup.GroupId
+    DependsOn: WebSecurityGroup
+  LC:
+    Type: "AWS::AutoScaling::LaunchConfiguration"
+    Properties:
+      AssociatePublicIpAddress: True
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", AMALINUX] # Dynamic mapping + Pseudo Parameter
+      InstanceType: t2.micro
+      SecurityGroups:
+        - !GetAtt WebSecurityGroup.GroupId
+      KeyName: "mindmajixindia"
+      UserData:
+        "Fn::Base64": !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd24 php70 mysql56-server php70-mysqlnd
+            service httpd start
+            chkconfig httpd on
+            sudo usermod -a -G apache ec2-user
+            sudo chown -R ec2-user:apache /var/www
+            sudo chmod 2775 /var/www
+            find /var/www -type d -exec sudo chmod 2775 {} \;
+            find /var/www -type f -exec sudo chmod 0664 {} \;
+            cd /var/www/html
+            wget https://www.dropbox.com/s/1ncoxr6nsl7o41q/sendy.zip
+            wget https://www.dropbox.com/s/ekurvma3fxafxtn/.htaccess
+            unzip sendy.zip
+            cd sendy
+            mv * /var/www/html
+            cd ..
+            rm sendy.zip
+            sudo sed -i "s/your_sendy_installation_url/${SendyURL}/g" includes/config.php
+            sudo sed -i "s/dbhost/${DB.Endpoint.Address}/g" includes/config.php
+            sudo sed -i "s/dbuser/${DatabaseMasterUser}/g" includes/config.php
+            sudo sed -i "s/dbpass/${DatabasePassword}/g" includes/config.php
+            sudo sed -i "s/dbname/${DatabaseName}/g" includes/config.php
+            sudo sed -i "s/AllowOverride None/AllowOverride All/g" /etc/httpd/conf/httpd.conf
+            sudo service httpd restart
+    DependsOn: DB
+  myELB:
+    Type: "AWS::ElasticLoadBalancing::LoadBalancer"
+    Properties:
+      LoadBalancerName: 'MyLoadBalancer'
+      AvailabilityZones: !GetAZs ''
+      CrossZone: true
+      SecurityGroups:
+        - !GetAtt WebSecurityGroup.GroupId
+      Listeners:
+        - LoadBalancerPort: '80'
+          InstancePort: '80'
+          Protocol: HTTP
+    DependsOn: WebSecurityGroup
+  AG:
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+    Properties:
+      LaunchConfigurationName: !Ref LC
+      LoadBalancerNames:
+        - !Ref myELB
+      AvailabilityZones: !GetAZs ''
+      HealthCheckGracePeriod: 900
+      DesiredCapacity: 1
+      HealthCheckType: ELB
+      MaxSize: 2
+      MinSize: 1
+      VPCZoneIdentifier:
+        - !Select [0, !Ref InstanceSubnets]
+        - !Select [1, !Ref InstanceSubnets]
+        - !Select [2, !Ref InstanceSubnets]
+        - !Select [3, !Ref InstanceSubnets]
+        - !Select [4, !Ref InstanceSubnets]
+        - !Select [5, !Ref InstanceSubnets]
+  WLC:
+    Type: "AWS::AutoScaling::LaunchConfiguration"
+    Properties:
+      AssociatePublicIpAddress: True
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", AMALINUX] # Dynamic mapping + Pseudo Parameter
+      InstanceType: t2.micro
+      SecurityGroups:
+        - !GetAtt WebSecurityGroup.GroupId
+      KeyName: "mindmajixindia"
+      UserData:
+        "Fn::Base64": !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y httpd24 php70 mysql56-server php70-mysqlnd
+            service httpd start
+            chkconfig httpd on
+            sudo usermod -a -G apache ec2-user
+            sudo chown -R ec2-user:apache /var/www
+            sudo chmod 2775 /var/www
+            sudo chmod 2775 /var/www
+            find /var/www -type d -exec sudo chmod 2775 {} \;
+            find /var/www -type f -exec sudo chmod 0664 {} \;
+            wget https://www.dropbox.com/s/g8srgvptlkyorjy/website.zip
+            unzip website.zip
+            cd website
+            mv * /var/www/html
+            cd ..
+            rm website.zip
+            find /var/www -type f -exec sudo chmod 775 {} \;
+            sudo service httpd restart
+  mySiteELB:
+    Type: "AWS::ElasticLoadBalancing::LoadBalancer"
+    Properties:
+      LoadBalancerName: 'MySiteLoadBalancer'
+      AvailabilityZones: !GetAZs ''
+      CrossZone: true
+      SecurityGroups:
+        - !GetAtt WebSecurityGroup.GroupId
+      Listeners:
+        - LoadBalancerPort: '80'
+          InstancePort: '80'
+          Protocol: HTTP
+    DependsOn: WebSecurityGroup
+  AGWeb:
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+    Properties:
+      LaunchConfigurationName: !Ref WLC
+      LoadBalancerNames:
+        - !Ref mySiteELB
+      AvailabilityZones: !GetAZs ''
+      HealthCheckGracePeriod: 900
+      DesiredCapacity: 1
+      HealthCheckType: ELB
+      MaxSize: 2
+      MinSize: 1
+      VPCZoneIdentifier:
+        - !Select [0, !Ref InstanceSubnets]
+        - !Select [1, !Ref InstanceSubnets]
+        - !Select [2, !Ref InstanceSubnets]
+        - !Select [3, !Ref InstanceSubnets]
+        - !Select [4, !Ref InstanceSubnets]
+        - !Select [5, !Ref InstanceSubnets]
+   
